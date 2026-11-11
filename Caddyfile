@@ -1,0 +1,4 @@
+# Reverse proxy with automatic HTTPS. Wired into docker-compose in the deployment step.
+{$DOMAIN} {
+	reverse_proxy app:8000
+}

@@ -10,7 +10,7 @@ Statuses: `todo`, `in progress`, `done`, `blocked`. The current step is the firs
 
 | Step | Title | Status |
 |---|---|---|
-| 1 | Project skeleton and Docker | todo |
+| 1 | Project skeleton and Docker | done |
 | 2 | Database | todo |
 | 3 | Telegram Bot API client | todo |
 | 4 | Telegram Login (separate from OAuth) | todo |
@@ -312,3 +312,9 @@ One entry per step, 2-5 lines: what was done, validation results, what is still 
 - Validation: compose up ok, /health ok, missing BOT_TOKEN fails with an error, pytest 3/3.
 - Open: nothing.
 -->
+
+### Step 1 - 2026-11-11
+- Skeleton: uv project (Python 3.14), Starlette app with `GET /health`, env config with startup validation, Dockerfile (uv, non-root), compose, `.env.example`, CI (secrets + test jobs), PR template.
+- Validation: compose up ok, `/health` → `{"status":"ok"}`, missing BOT_TOKEN exits with "missing required variables: BOT_TOKEN", both env_guard checks ok, `uv lock --check` ok, pytest 11/11.
+- Note: locally `ENV_FILE=.env.example` must be set for every compose command (`exec`, `down` too), not only `up`.
+- Open: Caddyfile is a stub, wired into compose in step 7.

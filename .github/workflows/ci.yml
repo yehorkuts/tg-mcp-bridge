@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [dev, main]
+  push:
+    branches: [dev]
+
+permissions:
+  contents: read
+
+jobs:
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+      - name: .env.example has placeholders only
+        run: python .claude/hooks/env_guard.py --check .env.example
+      - name: No secret env files tracked
+        run: python .claude/hooks/env_guard.py --check-repo
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@v3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          version: "0.11.18"
+          python-version: "3.14"
+      - name: Lockfile is up to date
+        run: uv lock --check
+      - name: Install dependencies
+        run: uv sync --frozen
+      - name: Tests
+        run: uv run pytest
+      - name: Docker build
+        run: docker build -t tg-mcp-bridge:ci .

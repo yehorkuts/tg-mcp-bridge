@@ -1,0 +1,13 @@
+# Secrets: only the placeholder template is tracked.
+.env
+.env.*
+!.env.example
+
+# Runtime data (SQLite volume).
+data/
+
+# Python / uv.
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/

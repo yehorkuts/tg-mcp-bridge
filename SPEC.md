@@ -27,7 +27,9 @@ A remote MCP server that lets Claude (claude.ai, scheduled tasks, Claude Code) s
 
 ## Stack
 
-- Python 3.12, the official `mcp` SDK, Starlette (or FastAPI), `httpx`
+- Python 3.14, pinned everywhere: `.python-version` = `3.14`, `requires-python = ">=3.14,<3.15"` in `pyproject.toml`, Docker base image `python:3.14-slim`, CI Python 3.14
+- uv for the Python toolchain, dependencies and the virtualenv: `pyproject.toml` + committed `uv.lock`, dev dependencies in a `dev` group. No pip, no `requirements.txt`, no manual `virtualenv`/`venv`. Commands run via `uv run` (e.g. `uv run pytest`)
+- The official `mcp` SDK, Starlette (or FastAPI), `httpx`
 - SQLite (file on a volume), no ORM or minimal SQLAlchemy Core
 - pytest + respx (HTTP mocking)
 - Docker + docker compose, Caddy as a reverse proxy with automatic HTTPS

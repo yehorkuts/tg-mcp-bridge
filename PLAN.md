@@ -28,7 +28,9 @@ Statuses: `todo`, `in progress`, `done`, `blocked`. The current step is the firs
 ## Step 1. Project skeleton and Docker
 
 Do:
-- Layout: `app/` (code), `tests/`, `Dockerfile`, `docker-compose.yml`, `Caddyfile`, `.env.example`, `README.md`. `.claude/` already exists (set up by the operator) - do not modify it.
+- Layout: `app/` (code), `tests/`, `pyproject.toml`, `uv.lock`, `.python-version`, `Dockerfile`, `docker-compose.yml`, `Caddyfile`, `.env.example`, `README.md`. `.claude/` already exists (set up by the operator) - do not modify it.
+- Python project managed by uv (see SPEC.md, "Stack"): `uv init` style `pyproject.toml` with `requires-python = ">=3.14,<3.15"`, runtime deps via `uv add`, test deps via `uv add --dev`, `uv.lock` committed.
+- `Dockerfile`: base `python:3.14-slim`, uv copied from the official `ghcr.io/astral-sh/uv` image, dependencies installed with `uv sync --frozen --no-dev` (lockfile is the source of truth), app runs as a non-root user.
 - Starlette app with `GET /health` → `{"status":"ok"}`.
 - Config loaded from env with validation (fail at startup if `BASE_URL` or `BOT_TOKEN` is missing). Tests set config via fixtures, never via env files.
 - `docker-compose.yml`: service `app` (port 8000 internal only), volume `./data:/data`, `env_file: ${ENV_FILE:-.env}`. No Caddy yet.
@@ -36,7 +38,7 @@ Do:
 - `.gitignore`: `.env`, `.env.*`, `!.env.example`, `data/`.
 - CI: `.github/workflows/ci.yml` on `pull_request` to `dev` and `main` and on `push` to `dev`:
   - job `secrets`: `python .claude/hooks/env_guard.py --check .env.example`, `python .claude/hooks/env_guard.py --check-repo`, gitleaks (`gitleaks/gitleaks-action`, full history);
-  - job `test`: install dependencies, `pytest`, `docker build`.
+  - job `test`: `astral-sh/setup-uv` with Python 3.14, `uv lock --check`, `uv sync --frozen`, `uv run pytest`, `docker build`.
   - No secrets in CI (tests never call external services).
 - `.github/pull_request_template.md` with the sections from CLAUDE.md ("What was done", "Validation", "Open / deferred", "Manual actions needed").
 
@@ -45,7 +47,7 @@ Validation:
 - `docker compose exec app curl -s localhost:8000/health` → `{"status":"ok"}`.
 - `git status --ignored` shows no `.env` in the repo; both `env_guard.py` checks pass locally.
 - Starting without `BOT_TOKEN` fails with a clear error.
-- `pytest` passes (at least a test for `/health`).
+- `uv run pytest` passes (at least a test for `/health`); `uv lock --check` passes; `uv run python --version` shows 3.14.
 - CI ran on this step's PR and is green.
 
 ## Step 2. Database
@@ -65,11 +67,11 @@ Do:
 - `app/telegram.py`: `send_message(chat_id, text)` via `https://api.telegram.org/bot<TOKEN>/sendMessage`, plain text without `parse_mode`.
 - Split text into chunks of up to 4000 characters, on line boundaries where possible.
 - Error handling: 403 → `BotBlocked` exception; 429 → one retry after `retry_after`; anything else → exception with a description.
-- Script `python -m app.cli send <tg_id> "<text>"` for manual checks.
+- Script `uv run python -m app.cli send <tg_id> "<text>"` for manual checks (inside the container: `python -m app.cli ...`).
 
 Validation:
 - respx tests: short text = 1 request; 9000-character text = 3 requests in the right order; 403 → `BotBlocked`; 429 → retry.
-- Manual (done by the operator, needs the real token; Claude Code only gives the command): after the owner sends /start to the bot, `python -m app.cli send <owner tg_id> "test"` delivers the message.
+- Manual (done by the operator, needs the real token; Claude Code only gives the command): after the owner sends /start to the bot, `uv run python -m app.cli send <owner tg_id> "test"` delivers the message.
 
 ## Step 4. Telegram Login (separate from OAuth)
 
@@ -257,7 +259,7 @@ Do:
 
 Validation:
 - Tests (respx): 3 limit rejections within an hour → exactly 1 alert to `ADMIN_TG_ID`; the 4th and 5th rejection in the same hour trigger no alert; after the cooldown the alert fires again; a failed alert send does not break the tool call; the digest has the right numbers on test data.
-- Manual: with a lowered limit (e.g. `DAILY_MESSAGE_LIMIT=2`) trigger an alert and receive it in Telegram; check the digest with `python -m app.cli digest`.
+- Manual: with a lowered limit (e.g. `DAILY_MESSAGE_LIMIT=2`) trigger an alert and receive it in Telegram; check the digest with `uv run python -m app.cli digest`.
 
 ### 12.4 Admin bot commands
 

@@ -44,10 +44,12 @@ Remote MCP server + OAuth + Telegram bot: Claude sends messages and quizzes to a
 - If you find a contradiction or a gap in SPEC.md or PLAN.md - stop and ask, do not silently fill it in.
 - Changes to SPEC.md and PLAN.md (other than status and log) only with the operator's consent.
 - Secrets (`.env`, tokens) never go into commits, PRs or PR descriptions.
+- Never put Claude session links into commits, PR titles or descriptions, issues or comments: no `Claude-Session:` trailers and no `claude.ai/code/session_...` URLs. They are private to the operator and mean nothing to readers. A `Co-Authored-By: Claude ...` trailer is fine.
+- Python 3.14 and uv only: add dependencies with `uv add` / `uv add --dev`, run everything with `uv run`, commit `uv.lock`. Never use `pip install`, `requirements.txt` or a hand-made venv. If uv is missing, ask the operator to install it (`brew install uv`).
 
 ## End of step (acceptance = validation passed)
 
-1. All tests are green (`pytest`), the step's validation passes.
+1. All tests are green (`uv run pytest`), the step's validation passes.
 2. In `PLAN.md` on the step branch: status → `done`, an entry in "Log" (2-5 lines).
 3. Commit, `git push -u origin step/NN-...`.
 4. Create the PR right away: `gh pr create --base dev --title "Step N: <title>"`. Description:

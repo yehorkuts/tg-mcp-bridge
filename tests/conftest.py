@@ -2,7 +2,7 @@ import pytest
 from starlette.testclient import TestClient
 
 from app.config import Settings
-from app.db import Database
+from app.db import Database, sqlite_url
 from app.main import create_app
 
 FAKE_ENV = {
@@ -24,7 +24,7 @@ def client(settings: Settings) -> TestClient:
 
 @pytest.fixture
 def db(tmp_path) -> Database:
-    database = Database(str(tmp_path / "test.sqlite"))
+    database = Database(sqlite_url(str(tmp_path / "test.sqlite")))
     database.init_schema()
     yield database
     database.close()

@@ -9,7 +9,7 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 
 from app.config import Settings
-from app.db import open_database
+from app.db import open_database, sqlite_url
 
 
 async def health(request: Request) -> JSONResponse:
@@ -19,7 +19,7 @@ async def health(request: Request) -> JSONResponse:
 def create_app(settings: Settings) -> Starlette:
     @contextlib.asynccontextmanager
     async def lifespan(app: Starlette) -> AsyncIterator[None]:
-        async with open_database(settings.db_path) as db:
+        async with open_database(sqlite_url(settings.db_path)) as db:
             app.state.db = db
             yield
 

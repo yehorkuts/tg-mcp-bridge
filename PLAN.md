@@ -320,7 +320,7 @@ One entry per step, 2-5 lines: what was done, validation results, what is still 
 - Open: Caddyfile is a stub, wired into compose in step 7.
 
 ### Step 2 - 2026-11-11
-- `app/db.py`: stdlib sqlite3 (WAL, autocommit), idempotent schema for users, clients, pending_auth, auth_codes, tokens; access functions per table; `hash_secret()`, `new_secret()`. Codes and tokens are passed raw and stored only as SHA-256.
+- `app/db.py` on SQLAlchemy Core (SQLite, WAL), portable schema for users, clients, pending_auth, auth_codes, tokens (BigInteger ids/timestamps, so Postgres is a URL change); access functions per table; `hash_secret()`, `new_secret()`. Codes and tokens are passed raw and stored only as SHA-256.
 - Cleanup: background job in the app lifespan, runs at startup and then hourly; lookups also filter out expired rows between passes. Auth codes are consumed atomically (`UPDATE ... RETURNING`).
-- Validation: pytest 35/35 (schema twice, CRUD per table, expiry, cleanup, hash-only storage); compose up ok, DB created in `/data`, restart on an existing DB ok.
+- Validation: pytest 38/38 (schema twice, Postgres DDL compiles, CRUD per table, 64-bit tg_id, expiry, cleanup, hash-only storage); compose up ok, DB created in `/data`, restart on an existing DB ok.
 - Open: on a Linux host the bind-mounted `./data` must be writable by uid 10001 (Docker Desktop on macOS hides this) - handle in step 7.

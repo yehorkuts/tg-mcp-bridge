@@ -1,15 +1,19 @@
 import asyncio
-import sqlite3
 
 import pytest
+import sqlalchemy as sa
+from sqlalchemy.dialects import postgresql
+from sqlalchemy.schema import CreateIndex, CreateTable
 
 from app.db import (
     AUTH_CODE_TTL,
     PENDING_AUTH_TTL,
     Database,
     hash_secret,
+    metadata,
     new_secret,
     open_database,
+    sqlite_url,
 )
 
 NOW = 1_800_000_000
@@ -19,13 +23,25 @@ REDIRECT = "https://claude.ai/api/mcp/auth_callback"
 
 def dump_db(db: Database) -> str:
     """Every value stored in every table, as one string."""
-    conn = db._conn
-    tables = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")]
     parts = []
-    for table in tables:
-        for row in conn.execute(f"SELECT * FROM {table}"):
-            parts.extend(str(v) for v in tuple(row))
+    with db.engine.connect() as conn:
+        for name in sa.inspect(conn).get_table_names():
+            for row in conn.execute(sa.text(f"SELECT * FROM {name}")):
+                parts.extend(str(v) for v in tuple(row))
     return "\n".join(parts)
+
+
+def table_names(db: Database) -> set[str]:
+    return set(sa.inspect(db.engine).get_table_names())
+
+
+def column(db: Database, sql: str) -> list:
+    with db.engine.connect() as conn:
+        return list(conn.execute(sa.text(sql)).scalars())
+
+
+def count(db: Database, table: str) -> int:
+    return column(db, f"SELECT COUNT(*) FROM {table}")[0]
 
 
 # helpers
@@ -45,26 +61,40 @@ def test_hash_secret_is_sha256_hex():
 
 
 def test_init_schema_is_idempotent(tmp_path):
-    path = str(tmp_path / "db.sqlite")
-    db = Database(path)
+    url = sqlite_url(str(tmp_path / "db.sqlite"))
+    db = Database(url)
     db.init_schema()
     db.upsert_user(1, "alice", "Alice", now=NOW)
     db.init_schema()
     db.close()
 
-    db = Database(path)
+    db = Database(url)
     db.init_schema()
     assert db.get_user(1) is not None
     db.close()
 
 
 def test_schema_has_step_2_tables(db):
-    names = {r[0] for r in db._conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-    assert {"users", "clients", "pending_auth", "auth_codes", "tokens"} <= names
+    assert {"users", "clients", "pending_auth", "auth_codes", "tokens"} <= table_names(db)
+
+
+def test_schema_compiles_for_postgres():
+    # Guards portability: the schema must stay expressible on Postgres.
+    dialect = postgresql.dialect()
+    for table in metadata.sorted_tables:
+        ddl = str(CreateTable(table).compile(dialect=dialect))
+        assert "SERIAL" not in ddl.upper()
+        for index in table.indexes:
+            CreateIndex(index).compile(dialect=dialect)
+
+
+def test_sqlite_pragmas(db):
+    assert column(db, "PRAGMA journal_mode") == ["wal"]
+    assert column(db, "PRAGMA foreign_keys") == [1]
 
 
 def test_creates_parent_directory(tmp_path):
-    db = Database(str(tmp_path / "nested" / "dir" / "db.sqlite"))
+    db = Database(sqlite_url(str(tmp_path / "nested" / "dir" / "db.sqlite")))
     db.init_schema()
     db.close()
     assert (tmp_path / "nested" / "dir" / "db.sqlite").exists()
@@ -97,6 +127,12 @@ def test_user_crud(db):
     assert db.delete_user(42) is False
 
 
+def test_user_with_64_bit_telegram_id(db):
+    big = 2**40
+    assert db.upsert_user(big, "bob", "Bob", now=NOW).tg_id == big
+    assert db.get_user(big).tg_id == big
+
+
 def test_user_optional_fields(db):
     user = db.upsert_user(7, None, None, now=NOW)
     assert user.username is None
@@ -114,7 +150,7 @@ def test_client_crud(db):
     assert db.get_client("client-1") == created
     assert db.get_client("unknown") is None
 
-    with pytest.raises(sqlite3.IntegrityError):
+    with pytest.raises(sa.exc.IntegrityError):
         db.create_client("client-1", "Dup", uris, now=NOW)
 
     assert db.delete_client("client-1") is True
@@ -198,8 +234,7 @@ def test_unknown_auth_code_cannot_be_consumed(db):
 def test_auth_code_stored_only_as_hash(db):
     code = new_secret()
     create_code(db, code)
-    row = db._conn.execute("SELECT code_hash FROM auth_codes").fetchone()
-    assert row["code_hash"] == hash_secret(code)
+    assert column(db, "SELECT code_hash FROM auth_codes") == [hash_secret(code)]
     assert code not in dump_db(db)
 
 
@@ -257,7 +292,7 @@ def test_tokens_stored_only_as_hash(db):
     access, refresh = new_secret(), new_secret()
     db.create_token(access, "access", 42, "c", [], ttl=60, now=NOW)
     db.create_token(refresh, "refresh", 42, "c", [], ttl=60, now=NOW)
-    hashes = {r["token_hash"] for r in db._conn.execute("SELECT token_hash FROM tokens")}
+    hashes = set(column(db, "SELECT token_hash FROM tokens"))
     assert hashes == {hash_secret(access), hash_secret(refresh)}
     dump = dump_db(db)
     assert access not in dump
@@ -282,8 +317,7 @@ def test_cleanup_removes_only_expired_rows(db):
     result = db.cleanup_expired(now=NOW + 1)
 
     assert (result.pending_auth, result.auth_codes, result.tokens) == (1, 1, 1)
-    count = lambda table: db._conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]  # noqa: E731
-    assert count("pending_auth") == count("auth_codes") == count("tokens") == 1
+    assert count(db, "pending_auth") == count(db, "auth_codes") == count(db, "tokens") == 1
     assert db.get_pending_auth(new_pending.id, now=NOW + 1) is not None
     assert db.get_pending_auth(old_pending.id, now=NOW - 999) is None
     assert db.get_auth_code(new_code) is not None
@@ -298,17 +332,17 @@ def test_cleanup_removes_only_expired_rows(db):
 
 def test_cleanup_job_runs_in_background(tmp_path):
     async def scenario():
-        path = str(tmp_path / "db.sqlite")
-        seed = Database(path)
+        url = sqlite_url(str(tmp_path / "db.sqlite"))
+        seed = Database(url)
         seed.init_schema()
         seed.create_token(new_secret(), "access", 1, "c", [], ttl=-1)
         seed.close()
 
-        async with open_database(path, cleanup_interval=0.01) as db:
+        async with open_database(url, cleanup_interval=0.01) as db:
             # The first pass runs right away.
             for _ in range(100):
                 await asyncio.sleep(0.01)
-                if db._conn.execute("SELECT COUNT(*) FROM tokens").fetchone()[0] == 0:
+                if count(db, "tokens") == 0:
                     break
             else:
                 pytest.fail("startup cleanup did not run")
@@ -317,7 +351,7 @@ def test_cleanup_job_runs_in_background(tmp_path):
             db.create_token(new_secret(), "access", 1, "c", [], ttl=-1)
             for _ in range(100):
                 await asyncio.sleep(0.01)
-                if db._conn.execute("SELECT COUNT(*) FROM tokens").fetchone()[0] == 0:
+                if count(db, "tokens") == 0:
                     break
             else:
                 pytest.fail("periodic cleanup did not run")
@@ -327,7 +361,7 @@ def test_cleanup_job_runs_in_background(tmp_path):
 
 def test_app_opens_database_on_startup(client, settings):
     assert client.app.state.db.get_user(1) is None
-    db = Database(settings.db_path)
-    names = {r[0] for r in db._conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    db = Database(sqlite_url(settings.db_path))
+    names = table_names(db)
     db.close()
     assert "users" in names

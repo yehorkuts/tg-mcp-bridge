@@ -1,4 +1,8 @@
-"""SQLite storage: schema, access functions and cleanup of expired rows.
+"""Database storage: schema, access functions and cleanup of expired rows.
+
+Built on SQLAlchemy Core with portable types, so the backend is chosen by the
+database URL. Production runs SQLite (a file on a volume); moving to Postgres
+should only need a different URL and the driver dependency.
 
 Raw authorization codes and tokens never reach the database: the access
 functions take the raw value and store only its SHA-256 hash.
@@ -10,16 +14,16 @@ the current time takes an optional `now` so tests can control the clock.
 import asyncio
 import contextlib
 import hashlib
-import json
 import logging
 import secrets
-import sqlite3
-import threading
 import time
-from collections.abc import AsyncIterator, Iterable
+from collections.abc import AsyncIterator, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
+
+import sqlalchemy as sa
+from sqlalchemy.dialects import postgresql, sqlite
 
 log = logging.getLogger(__name__)
 
@@ -30,61 +34,72 @@ AUTH_CODE_TTL = 300
 TokenKind = Literal["access", "refresh"]
 TOKEN_KINDS: tuple[str, ...] = ("access", "refresh")
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS users (
-    tg_id         INTEGER PRIMARY KEY,
-    username      TEXT,
-    first_name    TEXT,
-    created_at    INTEGER NOT NULL,
-    last_login_at INTEGER NOT NULL,
-    blocked_bot   INTEGER NOT NULL DEFAULT 0
-);
+metadata = sa.MetaData()
 
-CREATE TABLE IF NOT EXISTS clients (
-    client_id     TEXT PRIMARY KEY,
-    client_name   TEXT,
-    redirect_uris TEXT NOT NULL,
-    created_at    INTEGER NOT NULL
-);
+# Telegram ids and Unix timestamps can exceed 32 bits, hence BigInteger.
+users = sa.Table(
+    "users",
+    metadata,
+    sa.Column("tg_id", sa.BigInteger, primary_key=True, autoincrement=False),
+    sa.Column("username", sa.Text),
+    sa.Column("first_name", sa.Text),
+    sa.Column("created_at", sa.BigInteger, nullable=False),
+    sa.Column("last_login_at", sa.BigInteger, nullable=False),
+    sa.Column("blocked_bot", sa.Boolean, nullable=False, server_default=sa.false()),
+)
 
-CREATE TABLE IF NOT EXISTS pending_auth (
-    id             TEXT PRIMARY KEY,
-    client_id      TEXT NOT NULL,
-    redirect_uri   TEXT NOT NULL,
-    code_challenge TEXT NOT NULL,
-    state          TEXT,
-    scopes         TEXT NOT NULL DEFAULT '',
-    resource       TEXT,
-    expires_at     INTEGER NOT NULL
-);
+clients = sa.Table(
+    "clients",
+    metadata,
+    sa.Column("client_id", sa.Text, primary_key=True),
+    sa.Column("client_name", sa.Text),
+    sa.Column("redirect_uris", sa.JSON, nullable=False),
+    sa.Column("created_at", sa.BigInteger, nullable=False),
+)
 
-CREATE TABLE IF NOT EXISTS auth_codes (
-    code_hash      TEXT PRIMARY KEY,
-    tg_id          INTEGER NOT NULL,
-    client_id      TEXT NOT NULL,
-    redirect_uri   TEXT NOT NULL,
-    code_challenge TEXT NOT NULL,
-    scopes         TEXT NOT NULL DEFAULT '',
-    resource       TEXT,
-    expires_at     INTEGER NOT NULL,
-    used           INTEGER NOT NULL DEFAULT 0
-);
+pending_auth = sa.Table(
+    "pending_auth",
+    metadata,
+    sa.Column("id", sa.Text, primary_key=True),
+    sa.Column("client_id", sa.Text, nullable=False),
+    sa.Column("redirect_uri", sa.Text, nullable=False),
+    sa.Column("code_challenge", sa.Text, nullable=False),
+    sa.Column("state", sa.Text),
+    sa.Column("scopes", sa.Text, nullable=False, server_default=""),
+    sa.Column("resource", sa.Text),
+    sa.Column("expires_at", sa.BigInteger, nullable=False, index=True),
+)
 
-CREATE TABLE IF NOT EXISTS tokens (
-    token_hash TEXT PRIMARY KEY,
-    kind       TEXT NOT NULL CHECK (kind IN ('access', 'refresh')),
-    tg_id      INTEGER NOT NULL,
-    client_id  TEXT NOT NULL,
-    scopes     TEXT NOT NULL DEFAULT '',
-    expires_at INTEGER NOT NULL,
-    revoked    INTEGER NOT NULL DEFAULT 0
-);
+auth_codes = sa.Table(
+    "auth_codes",
+    metadata,
+    sa.Column("code_hash", sa.Text, primary_key=True),
+    sa.Column("tg_id", sa.BigInteger, nullable=False),
+    sa.Column("client_id", sa.Text, nullable=False),
+    sa.Column("redirect_uri", sa.Text, nullable=False),
+    sa.Column("code_challenge", sa.Text, nullable=False),
+    sa.Column("scopes", sa.Text, nullable=False, server_default=""),
+    sa.Column("resource", sa.Text),
+    sa.Column("expires_at", sa.BigInteger, nullable=False, index=True),
+    sa.Column("used", sa.Boolean, nullable=False, server_default=sa.false()),
+)
 
-CREATE INDEX IF NOT EXISTS idx_pending_auth_expires ON pending_auth (expires_at);
-CREATE INDEX IF NOT EXISTS idx_auth_codes_expires ON auth_codes (expires_at);
-CREATE INDEX IF NOT EXISTS idx_tokens_expires ON tokens (expires_at);
-CREATE INDEX IF NOT EXISTS idx_tokens_tg_id ON tokens (tg_id);
-"""
+tokens = sa.Table(
+    "tokens",
+    metadata,
+    sa.Column("token_hash", sa.Text, primary_key=True),
+    sa.Column("kind", sa.Text, nullable=False),
+    sa.Column("tg_id", sa.BigInteger, nullable=False, index=True),
+    sa.Column("client_id", sa.Text, nullable=False),
+    sa.Column("scopes", sa.Text, nullable=False, server_default=""),
+    sa.Column("expires_at", sa.BigInteger, nullable=False, index=True),
+    sa.Column("revoked", sa.Boolean, nullable=False, server_default=sa.false()),
+    sa.CheckConstraint("kind IN ('access', 'refresh')", name="ck_tokens_kind"),
+)
+
+# Dialect-specific INSERT constructs: both support ON CONFLICT and RETURNING
+# with the same API, which keeps upserts portable.
+_INSERTS = {"sqlite": sqlite.insert, "postgresql": postgresql.insert}
 
 
 def new_secret() -> str:
@@ -97,6 +112,12 @@ def hash_secret(raw: str) -> str:
     return hashlib.sha256(raw.encode()).hexdigest()
 
 
+def sqlite_url(path: str) -> str:
+    """SQLAlchemy URL for a SQLite file, creating its parent directory."""
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    return f"sqlite+pysqlite:///{path}"
+
+
 def _now(now: int | None) -> int:
     return int(time.time()) if now is None else now
 
@@ -107,6 +128,13 @@ def _scopes_to_db(scopes: Iterable[str]) -> str:
 
 def _scopes_from_db(raw: str) -> tuple[str, ...]:
     return tuple(raw.split())
+
+
+def _sqlite_on_connect(dbapi_conn: Any, _record: Any) -> None:
+    cur = dbapi_conn.cursor()
+    cur.execute("PRAGMA journal_mode=WAL")
+    cur.execute("PRAGMA foreign_keys=ON")
+    cur.close()
 
 
 @dataclass(frozen=True)
@@ -169,39 +197,32 @@ class CleanupResult:
 
 
 class Database:
-    """A single SQLite connection shared by the app.
+    """Access functions over a SQLAlchemy engine.
 
-    The connection runs in autocommit mode; every write is one statement, so
-    each one is atomic on its own. A lock serializes access in case a call
-    ever comes from a worker thread.
+    Every call runs in its own short transaction. Writes that must be atomic
+    (e.g. consuming an auth code) are a single statement.
     """
 
-    def __init__(self, path: str) -> None:
-        if path != ":memory:":
-            Path(path).parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(path, autocommit=True, check_same_thread=False)
-        self._conn.row_factory = sqlite3.Row
-        self._lock = threading.Lock()
-        with self._lock:
-            self._conn.execute("PRAGMA journal_mode=WAL")
-            self._conn.execute("PRAGMA foreign_keys=ON")
+    def __init__(self, url: str) -> None:
+        self.engine = sa.create_engine(url)
+        if self.engine.dialect.name == "sqlite":
+            sa.event.listen(self.engine, "connect", _sqlite_on_connect)
+        self._insert = _INSERTS[self.engine.dialect.name]
 
     def close(self) -> None:
-        with self._lock:
-            self._conn.close()
+        self.engine.dispose()
 
     def init_schema(self) -> None:
         """Create tables and indexes. Safe to call any number of times."""
-        with self._lock:
-            self._conn.executescript(SCHEMA)
+        metadata.create_all(self.engine)
 
-    def _execute(self, sql: str, params: Iterable[object] = ()) -> sqlite3.Cursor:
-        with self._lock:
-            return self._conn.execute(sql, tuple(params))
+    def _one(self, stmt: sa.Executable) -> Mapping[str, Any] | None:
+        with self.engine.begin() as conn:
+            return conn.execute(stmt).mappings().first()
 
-    def _one(self, sql: str, params: Iterable[object] = ()) -> sqlite3.Row | None:
-        with self._lock:
-            return self._conn.execute(sql, tuple(params)).fetchone()
+    def _rowcount(self, stmt: sa.Executable) -> int:
+        with self.engine.begin() as conn:
+            return conn.execute(stmt).rowcount
 
     # users
 
@@ -214,34 +235,35 @@ class Database:
     ) -> User:
         """Create the user on first login, refresh profile and login time after."""
         ts = _now(now)
-        row = self._one(
-            """
-            INSERT INTO users (tg_id, username, first_name, created_at, last_login_at)
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT (tg_id) DO UPDATE SET
-                username = excluded.username,
-                first_name = excluded.first_name,
-                last_login_at = excluded.last_login_at
-            RETURNING *
-            """,
-            (tg_id, username, first_name, ts, ts),
+        stmt = self._insert(users).values(
+            tg_id=tg_id,
+            username=username,
+            first_name=first_name,
+            created_at=ts,
+            last_login_at=ts,
         )
+        stmt = stmt.on_conflict_do_update(
+            index_elements=[users.c.tg_id],
+            set_={
+                "username": stmt.excluded.username,
+                "first_name": stmt.excluded.first_name,
+                "last_login_at": stmt.excluded.last_login_at,
+            },
+        ).returning(*users.c)
+        row = self._one(stmt)
         assert row is not None
         return _user(row)
 
     def get_user(self, tg_id: int) -> User | None:
-        row = self._one("SELECT * FROM users WHERE tg_id = ?", (tg_id,))
+        row = self._one(sa.select(users).where(users.c.tg_id == tg_id))
         return _user(row) if row else None
 
     def set_blocked_bot(self, tg_id: int, blocked: bool) -> bool:
-        cur = self._execute(
-            "UPDATE users SET blocked_bot = ? WHERE tg_id = ?", (int(blocked), tg_id)
-        )
-        return cur.rowcount > 0
+        stmt = users.update().where(users.c.tg_id == tg_id).values(blocked_bot=blocked)
+        return self._rowcount(stmt) > 0
 
     def delete_user(self, tg_id: int) -> bool:
-        cur = self._execute("DELETE FROM users WHERE tg_id = ?", (tg_id,))
-        return cur.rowcount > 0
+        return self._rowcount(users.delete().where(users.c.tg_id == tg_id)) > 0
 
     # clients
 
@@ -252,24 +274,26 @@ class Database:
         redirect_uris: Iterable[str],
         now: int | None = None,
     ) -> Client:
-        row = self._one(
-            """
-            INSERT INTO clients (client_id, client_name, redirect_uris, created_at)
-            VALUES (?, ?, ?, ?)
-            RETURNING *
-            """,
-            (client_id, client_name, json.dumps(list(redirect_uris)), _now(now)),
+        stmt = (
+            clients.insert()
+            .values(
+                client_id=client_id,
+                client_name=client_name,
+                redirect_uris=list(redirect_uris),
+                created_at=_now(now),
+            )
+            .returning(*clients.c)
         )
+        row = self._one(stmt)
         assert row is not None
         return _client(row)
 
     def get_client(self, client_id: str) -> Client | None:
-        row = self._one("SELECT * FROM clients WHERE client_id = ?", (client_id,))
+        row = self._one(sa.select(clients).where(clients.c.client_id == client_id))
         return _client(row) if row else None
 
     def delete_client(self, client_id: str) -> bool:
-        cur = self._execute("DELETE FROM clients WHERE client_id = ?", (client_id,))
-        return cur.rowcount > 0
+        return self._rowcount(clients.delete().where(clients.c.client_id == client_id)) > 0
 
     # pending_auth
 
@@ -285,37 +309,35 @@ class Database:
         ttl: int = PENDING_AUTH_TTL,
     ) -> PendingAuth:
         """Store an authorization request while the user signs in with Telegram."""
-        row = self._one(
-            """
-            INSERT INTO pending_auth
-                (id, client_id, redirect_uri, code_challenge, state, scopes, resource, expires_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            RETURNING *
-            """,
-            (
-                new_secret(),
-                client_id,
-                redirect_uri,
-                code_challenge,
-                state,
-                _scopes_to_db(scopes),
-                resource,
-                _now(now) + ttl,
-            ),
+        stmt = (
+            pending_auth.insert()
+            .values(
+                id=new_secret(),
+                client_id=client_id,
+                redirect_uri=redirect_uri,
+                code_challenge=code_challenge,
+                state=state,
+                scopes=_scopes_to_db(scopes),
+                resource=resource,
+                expires_at=_now(now) + ttl,
+            )
+            .returning(*pending_auth.c)
         )
+        row = self._one(stmt)
         assert row is not None
         return _pending_auth(row)
 
     def get_pending_auth(self, id: str, now: int | None = None) -> PendingAuth | None:
         """The pending request, or None if it is unknown or expired."""
         row = self._one(
-            "SELECT * FROM pending_auth WHERE id = ? AND expires_at > ?", (id, _now(now))
+            sa.select(pending_auth).where(
+                pending_auth.c.id == id, pending_auth.c.expires_at > _now(now)
+            )
         )
         return _pending_auth(row) if row else None
 
     def delete_pending_auth(self, id: str) -> bool:
-        cur = self._execute("DELETE FROM pending_auth WHERE id = ?", (id,))
-        return cur.rowcount > 0
+        return self._rowcount(pending_auth.delete().where(pending_auth.c.id == id)) > 0
 
     # auth_codes
 
@@ -332,30 +354,27 @@ class Database:
         ttl: int = AUTH_CODE_TTL,
     ) -> AuthCode:
         """Store an authorization code. Only the hash of `code` is written."""
-        row = self._one(
-            """
-            INSERT INTO auth_codes
-                (code_hash, tg_id, client_id, redirect_uri, code_challenge, scopes, resource, expires_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            RETURNING *
-            """,
-            (
-                hash_secret(code),
-                tg_id,
-                client_id,
-                redirect_uri,
-                code_challenge,
-                _scopes_to_db(scopes),
-                resource,
-                _now(now) + ttl,
-            ),
+        stmt = (
+            auth_codes.insert()
+            .values(
+                code_hash=hash_secret(code),
+                tg_id=tg_id,
+                client_id=client_id,
+                redirect_uri=redirect_uri,
+                code_challenge=code_challenge,
+                scopes=_scopes_to_db(scopes),
+                resource=resource,
+                expires_at=_now(now) + ttl,
+            )
+            .returning(*auth_codes.c)
         )
+        row = self._one(stmt)
         assert row is not None
         return _auth_code(row)
 
     def get_auth_code(self, code: str) -> AuthCode | None:
         """The code as stored, including used or expired ones (e.g. to detect reuse)."""
-        row = self._one("SELECT * FROM auth_codes WHERE code_hash = ?", (hash_secret(code),))
+        row = self._one(sa.select(auth_codes).where(auth_codes.c.code_hash == hash_secret(code)))
         return _auth_code(row) if row else None
 
     def consume_auth_code(self, code: str, now: int | None = None) -> AuthCode | None:
@@ -364,14 +383,17 @@ class Database:
         Returns None if the code is unknown, expired or already used, so a code
         can be exchanged at most once.
         """
-        row = self._one(
-            """
-            UPDATE auth_codes SET used = 1
-            WHERE code_hash = ? AND used = 0 AND expires_at > ?
-            RETURNING *
-            """,
-            (hash_secret(code), _now(now)),
+        stmt = (
+            auth_codes.update()
+            .where(
+                auth_codes.c.code_hash == hash_secret(code),
+                auth_codes.c.used == sa.false(),
+                auth_codes.c.expires_at > _now(now),
+            )
+            .values(used=True)
+            .returning(*auth_codes.c)
         )
+        row = self._one(stmt)
         return _auth_code(row) if row else None
 
     # tokens
@@ -389,62 +411,60 @@ class Database:
         """Store an access or refresh token. Only the hash of `token` is written."""
         if kind not in TOKEN_KINDS:
             raise ValueError(f"unknown token kind: {kind!r}")
-        row = self._one(
-            """
-            INSERT INTO tokens (token_hash, kind, tg_id, client_id, scopes, expires_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-            RETURNING *
-            """,
-            (hash_secret(token), kind, tg_id, client_id, _scopes_to_db(scopes), _now(now) + ttl),
+        stmt = (
+            tokens.insert()
+            .values(
+                token_hash=hash_secret(token),
+                kind=kind,
+                tg_id=tg_id,
+                client_id=client_id,
+                scopes=_scopes_to_db(scopes),
+                expires_at=_now(now) + ttl,
+            )
+            .returning(*tokens.c)
         )
+        row = self._one(stmt)
         assert row is not None
         return _token(row)
 
     def get_token(self, token: str, kind: TokenKind, now: int | None = None) -> Token | None:
         """The token if it exists, has this kind, is not revoked and not expired."""
         row = self._one(
-            """
-            SELECT * FROM tokens
-            WHERE token_hash = ? AND kind = ? AND revoked = 0 AND expires_at > ?
-            """,
-            (hash_secret(token), kind, _now(now)),
+            sa.select(tokens).where(
+                tokens.c.token_hash == hash_secret(token),
+                tokens.c.kind == kind,
+                tokens.c.revoked == sa.false(),
+                tokens.c.expires_at > _now(now),
+            )
         )
         return _token(row) if row else None
 
     def revoke_token(self, token: str) -> bool:
-        cur = self._execute(
-            "UPDATE tokens SET revoked = 1 WHERE token_hash = ? AND revoked = 0",
-            (hash_secret(token),),
+        stmt = (
+            tokens.update()
+            .where(tokens.c.token_hash == hash_secret(token), tokens.c.revoked == sa.false())
+            .values(revoked=True)
         )
-        return cur.rowcount > 0
+        return self._rowcount(stmt) > 0
 
     def revoke_user_tokens(self, tg_id: int, client_id: str | None = None) -> int:
         """Revoke all tokens of a user, optionally only those issued to one client."""
-        if client_id is None:
-            cur = self._execute(
-                "UPDATE tokens SET revoked = 1 WHERE tg_id = ? AND revoked = 0", (tg_id,)
-            )
-        else:
-            cur = self._execute(
-                "UPDATE tokens SET revoked = 1 WHERE tg_id = ? AND client_id = ? AND revoked = 0",
-                (tg_id, client_id),
-            )
-        return cur.rowcount
+        stmt = tokens.update().where(tokens.c.tg_id == tg_id, tokens.c.revoked == sa.false())
+        if client_id is not None:
+            stmt = stmt.where(tokens.c.client_id == client_id)
+        return self._rowcount(stmt.values(revoked=True))
 
     # cleanup
 
     def cleanup_expired(self, now: int | None = None) -> CleanupResult:
-        """Delete expired pending requests, codes and tokens."""
+        """Delete expired pending requests, codes and tokens in one transaction."""
         ts = _now(now)
-        with self._lock:
-            pending = self._conn.execute(
-                "DELETE FROM pending_auth WHERE expires_at <= ?", (ts,)
-            ).rowcount
-            codes = self._conn.execute(
-                "DELETE FROM auth_codes WHERE expires_at <= ?", (ts,)
-            ).rowcount
-            tokens = self._conn.execute("DELETE FROM tokens WHERE expires_at <= ?", (ts,)).rowcount
-        return CleanupResult(pending_auth=pending, auth_codes=codes, tokens=tokens)
+        with self.engine.begin() as conn:
+            counts = [
+                conn.execute(table.delete().where(table.c.expires_at <= ts)).rowcount
+                for table in (pending_auth, auth_codes, tokens)
+            ]
+        return CleanupResult(*counts)
 
 
 async def run_cleanup_loop(db: Database, interval: float = CLEANUP_INTERVAL_SECONDS) -> None:
@@ -465,10 +485,10 @@ async def run_cleanup_loop(db: Database, interval: float = CLEANUP_INTERVAL_SECO
 
 @contextlib.asynccontextmanager
 async def open_database(
-    path: str, cleanup_interval: float = CLEANUP_INTERVAL_SECONDS
+    url: str, cleanup_interval: float = CLEANUP_INTERVAL_SECONDS
 ) -> AsyncIterator[Database]:
     """Open the database, create the schema and run the hourly cleanup job."""
-    db = Database(path)
+    db = Database(url)
     db.init_schema()
     task = asyncio.create_task(run_cleanup_loop(db, cleanup_interval))
     try:
@@ -480,7 +500,7 @@ async def open_database(
         db.close()
 
 
-def _user(row: sqlite3.Row) -> User:
+def _user(row: Mapping[str, Any]) -> User:
     return User(
         tg_id=row["tg_id"],
         username=row["username"],
@@ -491,16 +511,16 @@ def _user(row: sqlite3.Row) -> User:
     )
 
 
-def _client(row: sqlite3.Row) -> Client:
+def _client(row: Mapping[str, Any]) -> Client:
     return Client(
         client_id=row["client_id"],
         client_name=row["client_name"],
-        redirect_uris=tuple(json.loads(row["redirect_uris"])),
+        redirect_uris=tuple(row["redirect_uris"]),
         created_at=row["created_at"],
     )
 
 
-def _pending_auth(row: sqlite3.Row) -> PendingAuth:
+def _pending_auth(row: Mapping[str, Any]) -> PendingAuth:
     return PendingAuth(
         id=row["id"],
         client_id=row["client_id"],
@@ -513,7 +533,7 @@ def _pending_auth(row: sqlite3.Row) -> PendingAuth:
     )
 
 
-def _auth_code(row: sqlite3.Row) -> AuthCode:
+def _auth_code(row: Mapping[str, Any]) -> AuthCode:
     return AuthCode(
         tg_id=row["tg_id"],
         client_id=row["client_id"],
@@ -526,7 +546,7 @@ def _auth_code(row: sqlite3.Row) -> AuthCode:
     )
 
 
-def _token(row: sqlite3.Row) -> Token:
+def _token(row: Mapping[str, Any]) -> Token:
     return Token(
         kind=row["kind"],
         tg_id=row["tg_id"],

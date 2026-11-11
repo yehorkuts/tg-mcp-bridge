@@ -11,7 +11,7 @@ Statuses: `todo`, `in progress`, `done`, `blocked`. The current step is the firs
 | Step | Title | Status |
 |---|---|---|
 | 1 | Project skeleton and Docker | done |
-| 2 | Database | todo |
+| 2 | Database | done |
 | 3 | Telegram Bot API client | todo |
 | 4 | Telegram Login (separate from OAuth) | todo |
 | 5 | OAuth 2.1 Authorization Server + DCR | todo |
@@ -318,3 +318,9 @@ One entry per step, 2-5 lines: what was done, validation results, what is still 
 - Validation: compose up ok, `/health` → `{"status":"ok"}`, missing BOT_TOKEN exits with "missing required variables: BOT_TOKEN", both env_guard checks ok, `uv lock --check` ok, pytest 11/11.
 - Note: locally `ENV_FILE=.env.example` must be set for every compose command (`exec`, `down` too), not only `up`.
 - Open: Caddyfile is a stub, wired into compose in step 7.
+
+### Step 2 - 2026-11-11
+- `app/db.py`: stdlib sqlite3 (WAL, autocommit), idempotent schema for users, clients, pending_auth, auth_codes, tokens; access functions per table; `hash_secret()`, `new_secret()`. Codes and tokens are passed raw and stored only as SHA-256.
+- Cleanup: background job in the app lifespan, runs at startup and then hourly; lookups also filter out expired rows between passes. Auth codes are consumed atomically (`UPDATE ... RETURNING`).
+- Validation: pytest 35/35 (schema twice, CRUD per table, expiry, cleanup, hash-only storage); compose up ok, DB created in `/data`, restart on an existing DB ok.
+- Open: on a Linux host the bind-mounted `./data` must be writable by uid 10001 (Docker Desktop on macOS hides this) - handle in step 7.
